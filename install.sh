@@ -13,6 +13,7 @@ sudo apt-get install -y \
     python3-gi-cairo \
     gir1.2-wnck-3.0 \
     xdotool \
+    xprintidle \
     dbus-x11
 
 echo ""
@@ -35,15 +36,18 @@ mkdir -p "$BIN_DIR"
 cp "$SCRIPT_DIR/daemon.py" "$BIN_DIR/timetracker-daemon"
 cp "$SCRIPT_DIR/tray.py"   "$BIN_DIR/timetracker-tray"
 cp "$SCRIPT_DIR/tt.py"     "$BIN_DIR/tt"
+cp "$SCRIPT_DIR/report.py" "$BIN_DIR/timetracker-report"
 
 chmod +x "$BIN_DIR/timetracker-daemon"
 chmod +x "$BIN_DIR/timetracker-tray"
 chmod +x "$BIN_DIR/tt"
+chmod +x "$BIN_DIR/timetracker-report"
 
 # Fix shebang to use system python3
 sed -i '1s|.*|#!/usr/bin/env python3|' "$BIN_DIR/timetracker-daemon"
 sed -i '1s|.*|#!/usr/bin/env python3|' "$BIN_DIR/timetracker-tray"
 sed -i '1s|.*|#!/usr/bin/env python3|' "$BIN_DIR/tt"
+sed -i '1s|.*|#!/usr/bin/env python3|' "$BIN_DIR/timetracker-report"
 
 echo ""
 echo "==> Creating autostart entry..."
@@ -60,8 +64,8 @@ Comment=Time tracker system tray
 EOF
 
 echo ""
-echo "==> Creating data directory..."
-mkdir -p "$HOME/.local/share/timetracker"
+echo "==> Creating data directories..."
+mkdir -p "$HOME/.local/share/timetracker/reports"
 
 echo ""
 echo "========================================="
@@ -70,7 +74,7 @@ echo "========================================="
 echo ""
 echo "  Start tray:    timetracker-tray"
 echo "  Start daemon:  timetracker-daemon"
-echo "  CLI:           tt today / tt current / tt week"
+echo "  CLI:           tt today / tt current / tt week / tt report --week"
 echo ""
 echo "  The tray will auto-start on next login."
 echo ""

@@ -12,8 +12,11 @@ from pathlib import Path
 DATA_DIR = Path.home() / ".local" / "share" / "timetracker"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 CURRENT_FILE = DATA_DIR / "current.json"
-POLL_INTERVAL = 2  # seconds
-IDLE_THRESHOLD = 30  # seconds before a gap creates a new session
+CLIENT_FILE = DATA_DIR / "active_client.json"
+
+POLL_INTERVAL = 2       # seconds between polls
+IDLE_THRESHOLD = 30     # seconds gap → new session (same app)
+IDLE_PAUSE = 300        # seconds of system idle → pause tracking
 
 
 # ---------------------------------------------------------------------------
@@ -34,22 +37,16 @@ def _try_window_calls_extended():
         )
         if result.returncode != 0 or not result.stdout.strip():
             return None
-        # Output: "([{'id': <uint64 …>, 'title': '…', 'wmclass': '…', 'focus': true, …}],)\n"
         raw = result.stdout.strip()
-        # Extract focused window
         focus_match = re.search(r"'focus':\s*<true>", raw)
         if not focus_match:
             return None
-        # Find the dict containing focus: true — grab title and wmclass
-        # Split on }, { to get individual window dicts
         title_match = re.search(r"'title':\s*<'([^']*)'>[^}]*'focus':\s*<true>", raw)
         if not title_match:
-            # title might come after focus
             title_match = re.search(r"'focus':\s*<true>[^}]*'title':\s*<'([^']*)'>", raw)
         class_match = re.search(r"'wmclass':\s*<'([^']*)'>[^}]*'focus':\s*<true>", raw)
         if not class_match:
             class_match = re.search(r"'focus':\s*<true>[^}]*'wmclass':\s*<'([^']*)'>", raw)
-
         title = title_match.group(1) if title_match else ""
         wmclass = class_match.group(1) if class_match else ""
         return {"title": title, "wmclass": wmclass, "method": "window-calls-extended"}
@@ -58,7 +55,6 @@ def _try_window_calls_extended():
 
 
 def _try_gnome_shell_eval():
-    """Classic gdbus eval (works only when not blocked by GNOME policy)."""
     try:
         script = (
             "let w=global.display.focus_window;"
@@ -90,7 +86,6 @@ def _try_gnome_shell_eval():
 
 
 def _try_xdotool():
-    """xdotool — works under XWayland, not pure Wayland."""
     try:
         wid_result = subprocess.run(
             ["xdotool", "getactivewindow"], capture_output=True, text=True, timeout=2
@@ -114,26 +109,14 @@ def _try_xdotool():
         return None
 
 
-def _try_ydotool():
-    """ydotool — Wayland-native input tool (limited window query support)."""
-    try:
-        # ydotool does not expose window queries directly; skip
-        return None
-    except Exception:
-        return None
-
-
 def _try_wnck():
-    """libwnck via python3-wnck — only works with XWayland."""
     try:
         import gi
         gi.require_version("Wnck", "3.0")
         from gi.repository import Wnck, GLib
-
         screen = Wnck.Screen.get_default()
         if screen is None:
             return None
-        # Force screen update
         ctx = GLib.MainContext.default()
         while ctx.pending():
             ctx.iteration(False)
@@ -150,69 +133,55 @@ def _try_wnck():
         return None
 
 
-# Detection strategy cache
 _active_method = None
 
 
 def get_active_window():
-    """Return dict with title, wmclass, method — or None."""
     global _active_method
-
-    methods = [
-        _try_window_calls_extended,
-        _try_gnome_shell_eval,
-        _try_xdotool,
-        _try_wnck,
-    ]
-
-    # If a method worked before, try it first
+    methods = [_try_window_calls_extended, _try_gnome_shell_eval, _try_xdotool, _try_wnck]
     if _active_method:
         result = _active_method()
         if result:
             return result
-        # Method stopped working — re-probe
         _active_method = None
-
     for method in methods:
         result = method()
         if result:
             _active_method = method
             return result
-
     return None
 
 
+def get_idle_seconds() -> float:
+    """Return seconds of system-level input idle time, 0 if unavailable."""
+    try:
+        result = subprocess.run(["xprintidle"], capture_output=True, text=True, timeout=1)
+        if result.returncode == 0:
+            return int(result.stdout.strip()) / 1000.0
+    except Exception:
+        pass
+    return 0.0
+
+
 # ---------------------------------------------------------------------------
-# Title parsing — extract app name + context (file/project)
+# Title parsing
 # ---------------------------------------------------------------------------
 
-# (pattern, app_name, context_group)  — context_group=None means use wmclass
 TITLE_RULES = [
-    # VSCode / Cursor / VSCodium:  "filename — folder — Code"
     (r"^(.+?)\s+[–—-]\s+(.+?)\s+[–—-]\s+(?:Visual Studio Code|VSCodium|Cursor)", "VSCode", 1),
-    # Neovim terminal title:  "NeoVim: filename"
     (r"^(?:Neo[Vv]im|VIM?):\s+(.+)", "Neovim", 1),
-    # Vim in terminal
     (r"^VIM\s+(.+)", "Vim", 1),
-    # Firefox / Chrome:  "Page Title — Mozilla Firefox"
     (r"^(.+?)\s+[–—-]\s+(?:Mozilla Firefox|Google Chrome|Chromium)", None, 1),
-    # Terminal (GNOME Terminal / Konsole / Kitty / Alacritty)
     (r"^(.+?)\s*[-–]\s*(?:GNOME Terminal|Terminal|Konsole|kitty|Alacritty)", "Terminal", 1),
-    # JetBrains IDEs:  "filename [project] — IDE"
     (r"^(.+?)\s+\[(.+?)\]\s+[–—-]\s+(?:IntelliJ|PyCharm|CLion|WebStorm|Rider|GoLand)", None, 2),
-    # Generic "Something — AppName"
     (r"^(.+?)\s+[–—-]\s+(\S+)\s*$", None, 1),
 ]
 
 
 def parse_title(title: str, wmclass: str) -> tuple[str, str]:
-    """Return (app_name, context) from window title + wmclass."""
-    # Normalise wmclass to something readable
     app_from_class = wmclass.split(".")[-1].strip() if wmclass else ""
-    # Capitalise first letter
     if app_from_class:
         app_from_class = app_from_class[0].upper() + app_from_class[1:]
-
     for pattern, app_override, ctx_group in TITLE_RULES:
         m = re.match(pattern, title, re.IGNORECASE)
         if m:
@@ -222,9 +191,18 @@ def parse_title(title: str, wmclass: str) -> tuple[str, str]:
             except IndexError:
                 context = ""
             return app, context
-
-    # Fallback: no match — use wmclass as app, title as context
     return app_from_class or wmclass or "Unknown", title[:80] if title else ""
+
+
+# ---------------------------------------------------------------------------
+# Client helpers
+# ---------------------------------------------------------------------------
+
+def read_active_client() -> str:
+    try:
+        return json.loads(CLIENT_FILE.read_text()).get("client", "")
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -264,53 +242,78 @@ def run():
 
     current_app = None
     current_context = None
+    current_client = None
     current_start = None
-    last_seen = None  # epoch of last successful poll
+    last_seen = None
+    was_idle = False
 
     print(f"[timetracker] daemon started, writing to {DATA_DIR}")
 
     while True:
-        win = get_active_window()
+        idle_secs = get_idle_seconds()
         now = time.time()
+
+        if idle_secs >= IDLE_PAUSE:
+            if not was_idle and current_app and current_start:
+                sessions.append({
+                    "app": current_app,
+                    "context": current_context,
+                    "client": current_client or "",
+                    "start": current_start,
+                    "end": now_iso(),
+                })
+                save_sessions(sessions)
+                current_app = None
+                current_context = None
+                current_client = None
+                current_start = None
+            was_idle = True
+            write_current({"idle": True, "idle_seconds": int(idle_secs)})
+            time.sleep(POLL_INTERVAL)
+            continue
+
+        if was_idle:
+            was_idle = False
+            last_seen = None  # reset gap detection after idle
+
+        win = get_active_window()
+        active_client = read_active_client()
 
         if win:
             app, context = parse_title(win["title"], win["wmclass"])
-            changed = (app != current_app or context != current_context)
 
-            # Gap too long → treat as new session even if same app
-            if last_seen and (now - last_seen) > IDLE_THRESHOLD:
-                changed = True
+            client_changed = active_client != current_client
+            app_changed = app != current_app or context != current_context
+            gap_break = last_seen is not None and (now - last_seen) > IDLE_THRESHOLD
 
-            if changed:
-                # Close previous session
+            if app_changed or client_changed or gap_break:
                 if current_app and current_start:
-                    sessions.append(
-                        {
-                            "app": current_app,
-                            "context": current_context,
-                            "start": current_start,
-                            "end": now_iso(),
-                        }
-                    )
+                    sessions.append({
+                        "app": current_app,
+                        "context": current_context,
+                        "client": current_client or "",
+                        "start": current_start,
+                        "end": now_iso(),
+                    })
                     save_sessions(sessions)
 
                 current_app = app
                 current_context = context
+                current_client = active_client
                 current_start = now_iso()
 
             last_seen = now
-            write_current(
-                {
-                    "app": current_app,
-                    "context": current_context,
-                    "start": current_start,
-                    "title": win["title"],
-                    "method": win["method"],
-                    "updated": now_iso(),
-                }
-            )
+            write_current({
+                "app": current_app,
+                "context": current_context,
+                "client": current_client,
+                "start": current_start,
+                "title": win["title"],
+                "method": win["method"],
+                "updated": now_iso(),
+                "idle": False,
+            })
         else:
-            # No window detected — clear current but keep session open
             write_current(None)
 
         time.sleep(POLL_INTERVAL)

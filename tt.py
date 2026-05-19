@@ -2,10 +2,12 @@
 """tt — time tracker CLI.
 
 Usage:
-  tt today          Show today's sessions grouped by app
+  tt today          Show today's sessions grouped by client then app
   tt current        Show currently active window/session
   tt week           Show this week's summary
   tt app <name>     Show sessions for a specific app today
+  tt client <name>  Show today's sessions for a specific client
+  tt report         Generate HTML report (--today / --week / --month)
   tt json           Dump today's raw sessions as JSON
   tt help           Show this help
 """
@@ -14,11 +16,14 @@ import json
 import sys
 from collections import defaultdict
 from datetime import datetime, date, timedelta
+
+import subprocess
 from pathlib import Path
 
 DATA_DIR = Path.home() / ".local" / "share" / "timetracker"
 SESSIONS_FILE = DATA_DIR / "sessions.json"
 CURRENT_FILE = DATA_DIR / "current.json"
+CLIENT_FILE = DATA_DIR / "active_client.json"
 
 # ANSI colours
 RESET = "\033[0m"
@@ -128,10 +133,20 @@ def inject_current(sessions: list, current: dict | None) -> list:
 # Commands
 # ---------------------------------------------------------------------------
 
+def read_active_client() -> str:
+    try:
+        return json.loads(CLIENT_FILE.read_text()).get("client", "")
+    except Exception:
+        return ""
+
+
 def cmd_current():
     cur = load_current()
     if not cur or not cur.get("app"):
         print(c("No active session detected.", "2"))
+        return
+    if cur.get("idle"):
+        print(c(f"Inactif depuis {fmt_duration(cur.get('idle_seconds', 0))}", "2"))
         return
     try:
         start = datetime.fromisoformat(cur["start"])
@@ -139,10 +154,12 @@ def cmd_current():
         dur = fmt_duration(elapsed)
     except Exception:
         dur = "?"
+    client_str = f"  [{c(cur.get('client', '') or 'sans client', '36')}]" if cur.get("client") else ""
     print(
         f"{colored_app(cur['app'])}  "
         + c(cur.get("context", ""), "2")
         + f"  {c(dur, '33')}"
+        + client_str
     )
     if cur.get("title"):
         print(c(f"  ↳ {cur['title'][:100]}", "2"))
@@ -160,24 +177,35 @@ def cmd_today():
         print(c("No sessions today.", "2"))
         return
 
-    by_app: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
-    for s in sessions:
-        by_app[s["app"]][s.get("context", "")].append(s)
-
     day_total = sum(session_duration(s) for s in sessions)
     print(f"{BOLD}Today  {today.strftime('%a %d %b')}{RESET}  —  {c(fmt_duration(day_total), '33')}")
     print()
 
-    for app_name, contexts in sorted(by_app.items(), key=lambda kv: -sum(session_duration(s) for sl in kv[1].values() for s in sl)):
-        app_total = sum(session_duration(s) for sl in contexts.values() for s in sl)
-        print(f"  {colored_app(app_name)}  {c(fmt_duration(app_total), '33')}")
+    # Group by client first, then by app
+    by_client: dict[str, list] = defaultdict(list)
+    for s in sessions:
+        client = s.get("client") or "Sans client"
+        by_client[client].append(s)
 
-        for ctx, ctx_sessions in sorted(contexts.items(), key=lambda kv: -sum(session_duration(s) for s in kv[1])):
-            ctx_total = sum(session_duration(s) for s in ctx_sessions)
-            is_live = any(s.get("end") is None for s in ctx_sessions)
-            live_tag = c(" ●LIVE", "31") if is_live else ""
-            label = ctx or c("(no context)", "2")
-            print(f"    {c(label, '0')}  {c(fmt_duration(ctx_total), '2')}{live_tag}")
+    for client_name, client_sessions in sorted(by_client.items(), key=lambda kv: -sum(session_duration(s) for s in kv[1])):
+        client_total = sum(session_duration(s) for s in client_sessions)
+        print(f"  {c(client_name, '36')}  {c(fmt_duration(client_total), '33')}")
+
+        by_app: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+        for s in client_sessions:
+            by_app[s["app"]][s.get("context", "")].append(s)
+
+        for app_name, contexts in sorted(by_app.items(), key=lambda kv: -sum(session_duration(s) for sl in kv[1].values() for s in sl)):
+            app_total = sum(session_duration(s) for sl in contexts.values() for s in sl)
+            print(f"    {colored_app(app_name)}  {c(fmt_duration(app_total), '33')}")
+
+            for ctx, ctx_sessions in sorted(contexts.items(), key=lambda kv: -sum(session_duration(s) for s in kv[1])):
+                ctx_total = sum(session_duration(s) for s in ctx_sessions)
+                is_live = any(s.get("end") is None for s in ctx_sessions)
+                live_tag = c(" ●LIVE", "31") if is_live else ""
+                label = ctx or c("(no context)", "2")
+                print(f"      {c(label, '0')}  {c(fmt_duration(ctx_total), '2')}{live_tag}")
+        print()
 
     print()
 
@@ -261,6 +289,45 @@ def cmd_app(name: str):
     print()
 
 
+def cmd_client(name: str):
+    today = date.today()
+    sessions = sessions_for_day(today)
+    current = load_current()
+    sessions = inject_current(sessions, current)
+
+    name_lower = name.lower()
+    matched = [s for s in sessions if name_lower in (s.get("client") or "").lower()]
+    if not matched:
+        print(c(f"No sessions for client '{name}' today.", "2"))
+        return
+
+    total = sum(session_duration(s) for s in matched)
+    print(f"{c(name, '36')}  {c(fmt_duration(total), '33')}")
+    print()
+
+    by_app: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
+    for s in matched:
+        by_app[s["app"]][s.get("context", "")].append(s)
+
+    for app_name, contexts in sorted(by_app.items(), key=lambda kv: -sum(session_duration(s) for sl in kv[1].values() for s in sl)):
+        app_total = sum(session_duration(s) for sl in contexts.values() for s in sl)
+        print(f"  {colored_app(app_name)}  {c(fmt_duration(app_total), '33')}")
+        for ctx, ctx_sessions in sorted(contexts.items(), key=lambda kv: -sum(session_duration(s) for s in kv[1])):
+            ctx_total = sum(session_duration(s) for s in ctx_sessions)
+            is_live = any(s.get("end") is None for s in ctx_sessions)
+            live_tag = c(" ●LIVE", "31") if is_live else ""
+            label = ctx or c("(no context)", "2")
+            print(f"    {c(label, '0')}  {c(fmt_duration(ctx_total), '2')}{live_tag}")
+    print()
+
+
+def cmd_report(args: list[str]):
+    script = Path(__file__).parent / "report.py"
+    cmd = [sys.executable, str(script), "--open"] + args
+    result = subprocess.run(cmd)
+    sys.exit(result.returncode)
+
+
 def cmd_json():
     today = date.today()
     sessions = sessions_for_day(today)
@@ -295,6 +362,13 @@ def main():
             print("Usage: tt app <name>")
             sys.exit(1)
         cmd_app(args[1])
+    elif cmd == "client":
+        if len(args) < 2:
+            print("Usage: tt client <name>")
+            sys.exit(1)
+        cmd_client(args[1])
+    elif cmd == "report":
+        cmd_report(args[1:])
     elif cmd in COMMANDS:
         COMMANDS[cmd]()
     else:
